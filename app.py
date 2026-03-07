@@ -138,6 +138,7 @@ class SharedState:
             "pose_landmarks": None,
             "driver_joints": None,   # arms + legs for 3D model
             "head_joints": None,     # face points for head driving
+            "hand_landmarks": None,  # left/right hand 21 points for 3D hands
         }
 
     def set_frame(self, jpeg_bytes):
@@ -320,6 +321,7 @@ def detection_loop():
                         cv2.circle(frame, (px, py), 3, (255, 200, 0), 1)     # outline
 
         # ---- Hands ----
+        hand_landmarks_payload = None
         if CONFIG["enable_hand_detection"]:
             hand_res = hand_det.detect(mp_img)
             if hand_res.hand_landmarks:
@@ -327,6 +329,20 @@ def detection_loop():
                     draw_connections(frame, hand_lm, HAND_CONNECTIONS, w, h,
                                      dot_color=(0, 255, 255), line_color=(255, 0, 255),
                                      dot_r=3, line_t=2)
+                hand_landmarks_payload = []
+                for j in range(len(hand_res.hand_landmarks)):
+                    hand_lm = hand_res.hand_landmarks[j]
+                    handedness = "Left"
+                    if hand_res.handedness and j < len(hand_res.handedness):
+                        h = hand_res.handedness[j]
+                        if getattr(h, "classification", None) and len(h.classification):
+                            handedness = h.classification[0].display_name
+                        elif isinstance(h, (list, tuple)) and len(h):
+                            handedness = getattr(h[0], "display_name", handedness)
+                    hand_landmarks_payload.append({
+                        "handedness": handedness,
+                        "landmarks": [[round(p.x, 4), round(p.y, 4), round(p.z, 4)] for p in hand_lm],
+                    })
         # Serialize pose (33 points) and driver joints (arms + legs) and head_joints (face)
         pose_landmarks = None
         driver_joints = None
@@ -358,6 +374,7 @@ def detection_loop():
             "pose_landmarks":  pose_landmarks,
             "driver_joints":   driver_joints,
             "head_joints":     head_joints,
+            "hand_landmarks":  hand_landmarks_payload,
         })
 
         _, jpeg = cv2.imencode(".jpg", frame)
@@ -465,7 +482,7 @@ PAGE_HTML = """<!DOCTYPE html>
   const dragOverlay = document.getElementById('drag-overlay');
 
   const scene  = new THREE.Scene();
-  scene.background = new THREE.Color(0x9bb5ce);  // natural sky (muted blue-gray)
+  scene.background = new THREE.Color(0x0d0d0d);  // dark background
   const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 1000);
   camera.position.set(0, 2, 4);
   camera.lookAt(0, 0, 0);
@@ -506,16 +523,227 @@ PAGE_HTML = """<!DOCTYPE html>
   scene.add(dLight);
 
   const floorGeo = new THREE.PlaneGeometry(5, 5);
-  const floorMat = new THREE.MeshLambertMaterial({ color: 0x404040 });  // dark gray
+  const floorMat = new THREE.MeshLambertMaterial({ color: 0x000000 });  // black floor
   const floor = new THREE.Mesh(floorGeo, floorMat);
   floor.rotation.x = -Math.PI / 2;
   floor.position.y = -1;
   scene.add(floor);
 
-  const glbUrl = (window.location && window.location.origin) ? window.location.origin + '/man.glb' : '/man.glb';
+  let avatarModel = null;
+  let avatarSkeleton = null;
+  const boneByName = {};
+  const restBoneQuats = {};
+  const _v1 = new THREE.Vector3();
+  const _v2 = new THREE.Vector3();
+  const _quat = new THREE.Quaternion();
+  const _quat2 = new THREE.Quaternion();
+
+  function vecFromLandmark(p) {
+    return new THREE.Vector3((p[0] - 0.5) * 2, (0.5 - p[1]) * 2, -p[2]);
+  }
+
+  function webcamTo3D(p) {
+    return new THREE.Vector3((p[0] - 0.5) * 2, (0.5 - p[1]) * 2, (p[2] != null ? -p[2] : 0));
+  }
+
+  function alignDirectionTo3DScreen(v) {
+    v.z = -v.z;
+  }
+
+  function findBoneByNames(names) {
+    const keys = Object.keys(boneByName);
+    for (const n of names) {
+      let best = null, bestLen = 1e9;
+      for (const key of keys) {
+        if ((key === n || key.indexOf(n) !== -1) && key.length < bestLen) {
+          best = boneByName[key]; bestLen = key.length;
+        }
+      }
+      if (best) return best;
+    }
+    return null;
+  }
+
+  function applyPose(data) {
+    if (!avatarModel) return;
+    const joints = data.driver_joints;
+    const hands = data.hand_landmarks || [];
+    const headJoints = data.head_joints || {};
+    if (!joints) return;
+    if (!avatarSkeleton && Object.keys(boneByName).length === 0) return;
+
+    const leftUpper = findBoneByNames(['LeftUpperArm', 'LeftArm', 'mixamorigLeftArm', 'mixamorig:LeftArm', 'Arm_L', 'upper_arm_l', 'Left arm', 'left_upper_arm', 'L_UpperArm', 'LeftShoulder', 'Shoulder_L', 'upper_arm.L', 'CC_Base_L_Upperarm']);
+    const leftFore = findBoneByNames(['LeftLowerArm', 'LeftForeArm', 'mixamorigLeftForeArm', 'mixamorig:LeftForeArm', 'ForeArm_L', 'forearm_l', 'Left forearm', 'left_lower_arm', 'L_ForeArm', 'Forearm_L', 'lower_arm.L', 'CC_Base_L_Forearm']);
+    const leftHand = findBoneByNames(['LeftHand', 'mixamorigLeftHand', 'mixamorig:LeftHand', 'Hand_L', 'hand_l', 'left_hand', 'Left hand', 'Wrist_L', 'wrist_l', 'CC_Base_L_Hand']);
+    const rightUpper = findBoneByNames(['RightUpperArm', 'RightArm', 'mixamorigRightArm', 'mixamorig:RightArm', 'Arm_R', 'upper_arm_r', 'Right arm', 'right_upper_arm', 'R_UpperArm', 'RightShoulder', 'Shoulder_R', 'upper_arm.R', 'CC_Base_R_Upperarm']);
+    const rightFore = findBoneByNames(['RightLowerArm', 'RightForeArm', 'mixamorigRightForeArm', 'mixamorig:RightForeArm', 'ForeArm_R', 'forearm_r', 'Right forearm', 'right_lower_arm', 'R_ForeArm', 'Forearm_R', 'lower_arm.R', 'CC_Base_R_Forearm']);
+    const rightHand = findBoneByNames(['RightHand', 'mixamorigRightHand', 'mixamorig:RightHand', 'Hand_R', 'hand_r', 'right_hand', 'Right hand', 'Wrist_R', 'wrist_r', 'CC_Base_R_Hand']);
+    const spine = findBoneByNames(['Spine', 'spine', 'mixamorigSpine', 'mixamorig:Spine', 'spine_01', 'CC_Base_Spine', 'Torso', 'torso']);
+    const spine1 = findBoneByNames(['Spine1', 'spine1', 'mixamorigSpine1', 'mixamorig:Spine1', 'spine_02', 'CC_Base_Spine1']);
+    const chest = findBoneByNames(['Chest', 'chest', 'mixamorigChest', 'mixamorig:Chest', 'UpperChest', 'spine_03', 'CC_Base_Chest']);
+    const neck = findBoneByNames(['Neck', 'neck', 'mixamorigNeck', 'mixamorig:Neck', 'CC_Base_Neck', 'neck_01']);
+    const head = findBoneByNames(['Head', 'head', 'mixamorigHead', 'mixamorig:Head', 'CC_Base_Head', 'head_01']);
+    const leftThigh = findBoneByNames(['LeftUpLeg', 'LeftThigh', 'mixamorigLeftUpLeg', 'mixamorig:LeftUpLeg', 'Thigh_L', 'thigh_l', 'upper_leg_l', 'CC_Base_L_Thigh', 'leg_l']);
+    const leftCalf = findBoneByNames(['LeftLeg', 'LeftLowerLeg', 'mixamorigLeftLeg', 'mixamorig:LeftLeg', 'Calf_L', 'calf_l', 'lower_leg_l', 'CC_Base_L_Calf', 'shin_l']);
+    const rightThigh = findBoneByNames(['RightUpLeg', 'RightThigh', 'mixamorigRightUpLeg', 'mixamorig:RightUpLeg', 'Thigh_R', 'thigh_r', 'upper_leg_r', 'CC_Base_R_Thigh', 'leg_r']);
+    const rightCalf = findBoneByNames(['RightLeg', 'RightLowerLeg', 'mixamorigRightLeg', 'mixamorig:RightLeg', 'Calf_R', 'calf_r', 'lower_leg_r', 'CC_Base_R_Calf', 'shin_r']);
+    const leftFoot = findBoneByNames(['LeftFoot', 'LeftToeBase', 'mixamorigLeftFoot', 'mixamorig:LeftFoot', 'Foot_L', 'foot_l', 'CC_Base_L_Foot']);
+    const rightFoot = findBoneByNames(['RightFoot', 'RightToeBase', 'mixamorigRightFoot', 'mixamorig:RightFoot', 'Foot_R', 'foot_r', 'CC_Base_R_Foot']);
+
+    const ls = joints.left_shoulder && vecFromLandmark(joints.left_shoulder);
+    const le = joints.left_elbow && vecFromLandmark(joints.left_elbow);
+    const lw = joints.left_wrist && vecFromLandmark(joints.left_wrist);
+    const rs = joints.right_shoulder && vecFromLandmark(joints.right_shoulder);
+    const re = joints.right_elbow && vecFromLandmark(joints.right_elbow);
+    const rw = joints.right_wrist && vecFromLandmark(joints.right_wrist);
+    const lh = joints.left_hip && vecFromLandmark(joints.left_hip);
+    const rh = joints.right_hip && vecFromLandmark(joints.right_hip);
+    const lk = joints.left_knee && vecFromLandmark(joints.left_knee);
+    const rk = joints.right_knee && vecFromLandmark(joints.right_knee);
+    const la = joints.left_ankle && vecFromLandmark(joints.left_ankle);
+    const ra = joints.right_ankle && vecFromLandmark(joints.right_ankle);
+
+    if (ls && le && leftUpper) {
+      _v2.subVectors(le, ls);
+      if (_v2.lengthSq() > 1e-6) { _v2.normalize(); _v1.set(-1, 0, 0); _quat.setFromUnitVectors(_v1, _v2); leftUpper.quaternion.slerp(_quat, 0.25); }
+    }
+    if (le && lw && leftFore) {
+      _v2.subVectors(lw, le);
+      if (_v2.lengthSq() > 1e-6) { _v2.normalize(); _v1.set(0, -1, 0); _quat.setFromUnitVectors(_v1, _v2); leftFore.quaternion.slerp(_quat, 0.25); }
+    }
+    if (rs && re && rightUpper) {
+      _v2.subVectors(re, rs);
+      if (_v2.lengthSq() > 1e-6) { _v2.normalize(); _v1.set(1, 0, 0); _quat.setFromUnitVectors(_v1, _v2); rightUpper.quaternion.slerp(_quat, 0.25); }
+    }
+    if (re && rw && rightFore) {
+      _v2.subVectors(rw, re);
+      if (_v2.lengthSq() > 1e-6) { _v2.normalize(); _v1.set(0, -1, 0); _quat.setFromUnitVectors(_v1, _v2); rightFore.quaternion.slerp(_quat, 0.25); }
+    }
+
+    if (ls && rs && lh && rh) {
+      const midShoulder = new THREE.Vector3().addVectors(ls, rs).multiplyScalar(0.5);
+      const midHip = new THREE.Vector3().addVectors(lh, rh).multiplyScalar(0.5);
+      const torsoUp = _v1.subVectors(midShoulder, midHip).normalize();
+      const shoulderLine = _v2.subVectors(rs, ls).normalize();
+      const torsoForward = new THREE.Vector3().crossVectors(shoulderLine, torsoUp).normalize();
+      if (torsoForward.lengthSq() < 1e-6) torsoForward.set(0, 0, 1);
+      const torsoRight = new THREE.Vector3().crossVectors(torsoUp, torsoForward).normalize();
+      const spineMat = new THREE.Matrix4();
+      spineMat.set(
+        torsoRight.x, torsoRight.y, torsoRight.z, 0,
+        torsoUp.x, torsoUp.y, torsoUp.z, 0,
+        torsoForward.x, torsoForward.y, torsoForward.z, 0,
+        0, 0, 0, 1
+      );
+      _quat.setFromRotationMatrix(spineMat);
+      const spineBone = spine || spine1 || chest;
+      if (spineBone) spineBone.quaternion.slerp(_quat, 0.2);
+      if (spine1 && spine1 !== spineBone) spine1.quaternion.slerp(_quat, 0.15);
+      if (chest && chest !== spineBone && chest !== spine1) chest.quaternion.slerp(_quat, 0.15);
+    }
+
+    if (lh && lk && leftThigh) {
+      _v2.subVectors(lk, lh);
+      if (_v2.lengthSq() > 1e-6) { _v2.normalize(); _v1.set(0, -1, 0); _quat.setFromUnitVectors(_v1, _v2); leftThigh.quaternion.slerp(_quat, 0.25); }
+    }
+    if (lk && la && leftCalf) {
+      _v2.subVectors(la, lk);
+      if (_v2.lengthSq() > 1e-6) { _v2.normalize(); _v1.set(0, -1, 0); _quat.setFromUnitVectors(_v1, _v2); leftCalf.quaternion.slerp(_quat, 0.25); }
+    }
+    if (rh && rk && rightThigh) {
+      _v2.subVectors(rk, rh);
+      if (_v2.lengthSq() > 1e-6) { _v2.normalize(); _v1.set(0, -1, 0); _quat.setFromUnitVectors(_v1, _v2); rightThigh.quaternion.slerp(_quat, 0.25); }
+    }
+    if (rk && ra && rightCalf) {
+      _v2.subVectors(ra, rk);
+      if (_v2.lengthSq() > 1e-6) { _v2.normalize(); _v1.set(0, -1, 0); _quat.setFromUnitVectors(_v1, _v2); rightCalf.quaternion.slerp(_quat, 0.25); }
+    }
+    if (la && lk && leftFoot) {
+      _v2.subVectors(la, lk).normalize();
+      if (_v2.lengthSq() > 1e-6) { _v1.set(0, 1, 0); _quat.setFromUnitVectors(_v1, _v2); leftFoot.quaternion.slerp(_quat, 0.15); }
+    }
+    if (ra && rk && rightFoot) {
+      _v2.subVectors(ra, rk).normalize();
+      if (_v2.lengthSq() > 1e-6) { _v1.set(0, 1, 0); _quat.setFromUnitVectors(_v1, _v2); rightFoot.quaternion.slerp(_quat, 0.15); }
+    }
+
+    const nose = headJoints.nose && webcamTo3D(headJoints.nose);
+    const leftEye = headJoints.left_eye && webcamTo3D(headJoints.left_eye);
+    const rightEye = headJoints.right_eye && webcamTo3D(headJoints.right_eye);
+    const chin = headJoints.chin && webcamTo3D(headJoints.chin);
+    if (neck && (nose || chin) && (leftEye || rightEye)) {
+      const headUp = nose && chin ? _v1.subVectors(nose, chin).normalize() : new THREE.Vector3(0, 1, 0);
+      const eyeMid = leftEye && rightEye ? new THREE.Vector3().addVectors(leftEye, rightEye).multiplyScalar(0.5) : (nose || chin);
+      const headForward = nose && eyeMid ? _v2.subVectors(nose, eyeMid).normalize() : new THREE.Vector3(0, 0, -1);
+      if (headForward.lengthSq() < 1e-6) headForward.set(0, 0, -1);
+      alignDirectionTo3DScreen(headUp);
+      alignDirectionTo3DScreen(headForward);
+      const headRight = new THREE.Vector3().crossVectors(headUp, headForward).normalize();
+      headForward.crossVectors(headRight, headUp).normalize();
+      const headMat = new THREE.Matrix4();
+      headMat.set(
+        headRight.x, headRight.y, headRight.z, 0,
+        headUp.x, headUp.y, headUp.z, 0,
+        headForward.x, headForward.y, headForward.z, 0,
+        0, 0, 0, 1
+      );
+      _quat.setFromRotationMatrix(headMat);
+      neck.quaternion.slerp(_quat, 0.2);
+    }
+    if (head && (nose || chin) && (leftEye || rightEye)) {
+      const headUp = nose && chin ? _v1.subVectors(nose, chin).normalize() : new THREE.Vector3(0, 1, 0);
+      const eyeMid = leftEye && rightEye ? new THREE.Vector3().addVectors(leftEye, rightEye).multiplyScalar(0.5) : (nose || chin);
+      const headForward = nose && eyeMid ? _v2.subVectors(nose, eyeMid).normalize() : new THREE.Vector3(0, 0, -1);
+      if (headForward.lengthSq() < 1e-6) headForward.set(0, 0, -1);
+      alignDirectionTo3DScreen(headUp);
+      alignDirectionTo3DScreen(headForward);
+      const headRight = new THREE.Vector3().crossVectors(headUp, headForward).normalize();
+      headForward.crossVectors(headRight, headUp).normalize();
+      const headMat = new THREE.Matrix4();
+      headMat.set(
+        headRight.x, headRight.y, headRight.z, 0,
+        headUp.x, headUp.y, headUp.z, 0,
+        headForward.x, headForward.y, headForward.z, 0,
+        0, 0, 0, 1
+      );
+      _quat.setFromRotationMatrix(headMat);
+      head.quaternion.slerp(_quat, 0.2);
+    }
+
+    for (const hand of hands) {
+      const lm = hand.landmarks;
+      if (!lm || lm.length < 10) continue;
+      const handedness = (hand.handedness || '').toLowerCase();
+      const isLeft = handedness === 'left';
+      const bone = isLeft ? leftHand : rightHand;
+      if (!bone) continue;
+      const wrist = webcamTo3D(lm[0]);
+      const midBase = webcamTo3D(lm[9]);
+      const idxBase = webcamTo3D(lm[5]);
+      _v1.subVectors(midBase, wrist).normalize();
+      _v2.subVectors(idxBase, wrist).normalize();
+      alignDirectionTo3DScreen(_v1);
+      alignDirectionTo3DScreen(_v2);
+      const palmNormal = new THREE.Vector3().crossVectors(_v1, _v2).normalize();
+      if (isLeft) palmNormal.negate();
+      alignDirectionTo3DScreen(palmNormal);
+      _v1.set(0, 0, -1);
+      _quat.setFromUnitVectors(_v1, palmNormal);
+      bone.quaternion.slerp(_quat, 0.2);
+    }
+
+    if (avatarSkeleton && typeof avatarSkeleton.update === 'function') {
+      avatarSkeleton.update();
+    } else {
+      avatarModel.traverse((o) => { if (o.isBone) o.updateMatrixWorld(true); });
+    }
+  }
+
+  const glbUrl = (window.location && window.location.origin) ? window.location.origin + '/final.glb' : '/final.glb';
   const loader = new GLTFLoader();
   loader.load(glbUrl, (gltf) => {
     const model = gltf.scene;
+    avatarModel = model;
     const maxAnisotropy = renderer.capabilities.getMaxAnisotropy();
     model.traverse((o) => {
       if (o.material) {
@@ -525,7 +753,22 @@ PAGE_HTML = """<!DOCTYPE html>
           if (mat.normalMap) mat.normalMap.anisotropy = maxAnisotropy;
         });
       }
+      if (o.isSkinnedMesh && o.skeleton && !avatarSkeleton) {
+        avatarSkeleton = o.skeleton;
+        o.skeleton.bones.forEach((b) => {
+          boneByName[b.name] = b;
+          restBoneQuats[b.name] = b.quaternion.clone();
+        });
+      }
+      if (o.isBone) boneByName[o.name] = o;
     });
+    if (!avatarSkeleton && Object.keys(boneByName).length > 0) {
+      avatarSkeleton = { bones: Object.values(boneByName), update: function() {} };
+    }
+    const nBones = Object.keys(boneByName).length;
+    const hasSkel = !!(avatarSkeleton && (avatarSkeleton.bones || avatarSkeleton).length);
+    console.log('Avatar loaded: ' + nBones + ' bones, skeleton: ' + hasSkel);
+    console.log('Bone names:', Object.keys(boneByName).sort().join(', '));
     model.rotation.y = Math.PI;
     model.position.set(0, 0, 0);
     model.scale.setScalar(1);
@@ -563,9 +806,12 @@ PAGE_HTML = """<!DOCTYPE html>
   const evtSource = new EventSource('/posture_events');
   evtSource.onmessage = e => {
     try {
-      const d = JSON.parse(e.data);
+      let raw = (e.data || '').trim();
+      if (raw.startsWith('data:')) raw = raw.slice(5).trim();
+      const d = JSON.parse(raw);
       lastAngle = d.angle;
       updatePosture(d.angle, d.good_posture, d.status);
+      applyPose(d);
     } catch (_) {}
   };
   evtSource.onerror = () => updatePosture(lastAngle, false, 'Reconnecting…');
@@ -616,11 +862,11 @@ def video_feed():
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-@app.route("/man.glb")
-def serve_man_glb():
-    path = os.path.join(SCRIPT_DIR, "man.glb")
+@app.route("/final.glb")
+def serve_final_glb():
+    path = os.path.join(SCRIPT_DIR, "final.glb")
     if not os.path.isfile(path):
-        return Response("man.glb not found", status=404)
+        return Response("final.glb not found", status=404)
     return send_file(path, mimetype="model/gltf-binary", as_attachment=False)
 
 
