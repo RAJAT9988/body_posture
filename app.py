@@ -12,7 +12,7 @@ import threading
 import urllib.request
 import os
 
-from flask import Flask, Response
+from flask import Flask, Response, send_file
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
@@ -302,7 +302,7 @@ def detection_loop():
                 status       = f"Bad Posture – {posture_type}"
                 good_posture = False
                 if bad_posture_cont >= CONFIG["bad_posture_alert_delay"] and CONFIG["enable_visual_alert"]:
-                    cv2.rectangle(frame, (0, 0), (w, h), (0, 0, 255), 15)
+                    pass  # visual alert disabled: no red border on webcam
 
         # ---- Face: driver dots for head (3D model)
         head_joints = None
@@ -404,20 +404,22 @@ PAGE_HTML = """<!DOCTYPE html>
       align-items: stretch;
       justify-content: stretch;
     }
-    .panel.canvas-panel .panel-label {
-      position: absolute; top: 8px; left: 50%; transform: translateX(-50%);
-      z-index: 2; margin: 0;
-    }
     .panel.canvas-panel #canvas-3d {
       position: absolute;
       top: 0; left: 0; right: 0; bottom: 0;
       width: 100%; height: 100%;
       display: block; background: #000;
     }
-    .panel.canvas-panel #statusBar3d {
-      position: absolute; bottom: 8px; left: 50%; transform: translateX(-50%);
-      z-index: 2; margin: 0;
+    .panel.canvas-panel .drag-overlay {
+      position: absolute;
+      top: 0; left: 0; right: 0; bottom: 0;
+      z-index: 1;
+      cursor: grab;
+      touch-action: none;
+      -webkit-user-select: none;
+      user-select: none;
     }
+    .panel.canvas-panel .drag-overlay:active { cursor: grabbing; }
     .panel-label {
       font-size: 0.7rem; margin-bottom: 6px; color: #00ffff;
       letter-spacing: 0.05em; text-transform: uppercase;
@@ -449,61 +451,112 @@ PAGE_HTML = """<!DOCTYPE html>
       <div id="statusBar" class="status-footer unknown">Waiting for posture data…</div>
     </div>
     <div class="panel canvas-panel">
-      <div class="panel-label">3D Posture</div>
       <canvas id="canvas-3d"></canvas>
-      <div id="statusBar3d" class="status-footer main unknown">Spine angle: -- °</div>
+      <div class="drag-overlay" id="drag-overlay" tabindex="0" title="Drag to rotate, scroll to zoom"></div>
     </div>
   </div>
   <script type="module">
   import * as THREE from 'three';
   import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+  import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
-  const statusBar   = document.getElementById('statusBar');
-  const statusBar3d = document.getElementById('statusBar3d');
-  const canvas      = document.getElementById('canvas-3d');
+  const statusBar = document.getElementById('statusBar');
+  const canvas = document.getElementById('canvas-3d');
+  const dragOverlay = document.getElementById('drag-overlay');
 
   const scene  = new THREE.Scene();
-  scene.background = new THREE.Color(0x000000);
+  scene.background = new THREE.Color(0x9bb5ce);  // natural sky (muted blue-gray)
   const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 1000);
   camera.position.set(0, 2, 4);
   camera.lookAt(0, 0, 0);
-  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setClearColor(0x9bb5ce, 1);
+  renderer.outputEncoding = THREE.sRGBEncoding;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1;
+  renderer.physicallyCorrectLights = true;
 
   function setSize() {
-    const w = canvas.clientWidth;
-    const h = canvas.clientHeight;
-    canvas.width = w;
-    canvas.height = h;
+    const w = Math.max(1, dragOverlay.clientWidth || canvas.clientWidth || 1);
+    const h = Math.max(1, dragOverlay.clientHeight || canvas.clientHeight || 1);
     renderer.setSize(w, h);
     camera.aspect = w / h;
     camera.updateProjectionMatrix();
   }
   setSize();
   window.addEventListener('resize', setSize);
+  requestAnimationFrame(() => setSize());
 
-  const controls = new OrbitControls(camera, canvas);
+  const controls = new OrbitControls(camera, dragOverlay);
   controls.enableDamping = true;
   controls.dampingFactor = 0.05;
   controls.target.set(0, 0, 0);
+  controls.enableRotate = true;
+  controls.enableZoom = true;
+  controls.enablePan = true;
+  dragOverlay.addEventListener('mousedown', function () { dragOverlay.focus({ preventScroll: true }); });
+  dragOverlay.addEventListener('touchstart', function (e) { e.preventDefault(); }, { passive: false });
+  dragOverlay.addEventListener('touchmove', function (e) { e.preventDefault(); }, { passive: false });
+  dragOverlay.addEventListener('touchend', function (e) { e.preventDefault(); }, { passive: false });
 
-  scene.add(new THREE.AmbientLight(0x404040, 0.6));
-  const dLight = new THREE.DirectionalLight(0xffffff, 0.8);
+  scene.add(new THREE.AmbientLight(0xffffff, 0.85));
+  const dLight = new THREE.DirectionalLight(0xffffff, 1.2);
   dLight.position.set(2, 4, 3);
   scene.add(dLight);
 
-  const grid = new THREE.GridHelper(8, 16, 0xb0b0b0, 0x909090);
-  grid.material.transparent = true;
-  grid.material.opacity = 0.55;
-  grid.position.y = -1;
-  scene.add(grid);
+  const floorGeo = new THREE.PlaneGeometry(5, 5);
+  const floorMat = new THREE.MeshLambertMaterial({ color: 0x404040 });  // dark gray
+  const floor = new THREE.Mesh(floorGeo, floorMat);
+  floor.rotation.x = -Math.PI / 2;
+  floor.position.y = -1;
+  scene.add(floor);
+
+  const glbUrl = (window.location && window.location.origin) ? window.location.origin + '/man.glb' : '/man.glb';
+  const loader = new GLTFLoader();
+  loader.load(glbUrl, (gltf) => {
+    const model = gltf.scene;
+    const maxAnisotropy = renderer.capabilities.getMaxAnisotropy();
+    model.traverse((o) => {
+      if (o.material) {
+        const mats = Array.isArray(o.material) ? o.material : [o.material];
+        mats.forEach((mat) => {
+          if (mat.map) { mat.map.anisotropy = maxAnisotropy; mat.map.encoding = THREE.sRGBEncoding; }
+          if (mat.normalMap) mat.normalMap.anisotropy = maxAnisotropy;
+        });
+      }
+    });
+    model.rotation.y = Math.PI;
+    model.position.set(0, 0, 0);
+    model.scale.setScalar(1);
+    model.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(model);
+    const size = box.getSize(new THREE.Vector3());
+    const modelH = Math.max(Math.abs(size.y), 0.01);
+    const scale = Math.min(10, Math.max(0.5, 1.8 / modelH));
+    model.scale.setScalar(scale);
+    model.updateMatrixWorld(true);
+    const box2 = new THREE.Box3().setFromObject(model);
+    const center = box2.getCenter(new THREE.Vector3());
+    model.position.x = -center.x;
+    model.position.z = -center.z;
+    model.position.y = -1 - box2.min.y;
+    scene.add(model);
+    const dirLight2 = new THREE.DirectionalLight(0xffffff, 1.1);
+    dirLight2.position.set(0, 3, 3);
+    scene.add(dirLight2);
+    const fillLight = new THREE.DirectionalLight(0xffffff, 0.7);
+    fillLight.position.set(-2, 2, 2);
+    scene.add(fillLight);
+    const backLight = new THREE.DirectionalLight(0xffffff, 0.5);
+    backLight.position.set(0, 2, -3);
+    scene.add(backLight);
+  });
 
   function updatePosture(angle, good, status) {
     const cls = good ? 'good' : (angle > 0 ? 'bad' : 'unknown');
     statusBar.className   = 'status-footer ' + cls;
     statusBar.textContent = status || 'No data';
-    statusBar3d.className = 'status-footer main ' + cls;
-    statusBar3d.textContent = 'Spine angle: ' + (angle != null ? angle + ' °' : '--');
   }
 
   let lastAngle = null;
@@ -558,6 +611,17 @@ def video_feed():
         mimetype="multipart/x-mixed-replace; boundary=frame",
         headers={"Cache-Control": "no-store"},
     )
+
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+@app.route("/man.glb")
+def serve_man_glb():
+    path = os.path.join(SCRIPT_DIR, "man.glb")
+    if not os.path.isfile(path):
+        return Response("man.glb not found", status=404)
+    return send_file(path, mimetype="model/gltf-binary", as_attachment=False)
 
 
 @app.route("/posture_events")
