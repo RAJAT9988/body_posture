@@ -1,0 +1,4 @@
+flask>=2.0.0
+opencv-python>=4.5.0
+# Use 0.10.30: 'solutions' API was removed in 0.10.31+
+mediapipe==0.10.30
