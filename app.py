@@ -58,7 +58,6 @@ CONFIG = {
     "frame_height": 480,
     "good_posture_min_angle": 140,
     "good_posture_max_angle": 180,
-    "detection_confidence": 0.5,
     "tracking_confidence": 0.5,
     "enable_hand_detection": True,
     "max_hands": 2,
@@ -78,6 +77,9 @@ CONFIG = {
     "show_angles": True,
     "show_statistics": True,
     "mirror_mode": True,
+    "show_landmark_labels": True,   # draw names next to pose/face/hand dots
+    "detection_confidence": 0.6,    # higher = more stable, fewer false detections (pose/hand/face)
+    "pose_smoothing_alpha": 0.35,   # blend: 0=very smooth, 1=raw; lower = calmer 3D motion
 }
 
 # ==================== LANDMARK TOPOLOGY ====================
@@ -106,6 +108,23 @@ HAND_CONNECTIONS = [
 # Arms: 11,12=shoulders 13,14=elbows 15,16=wrists
 # Legs: 23,24=hips 25,26=knees 27,28=ankles
 DRIVER_JOINTS = (11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28)
+
+# BlazePose 33 landmark names (for on-screen labels)
+POSE_LANDMARK_NAMES = {
+    0: "nose", 1: "L_eye_in", 2: "L_eye", 3: "L_eye_out", 4: "R_eye_in", 5: "R_eye", 6: "R_eye_out",
+    7: "L_ear", 8: "R_ear", 9: "mouth_L", 10: "mouth_R",
+    11: "L_shoulder", 12: "R_shoulder", 13: "L_elbow", 14: "R_elbow",
+    15: "L_wrist", 16: "R_wrist", 17: "L_pinky", 18: "R_pinky", 19: "L_index", 20: "R_index",
+    21: "L_thumb", 22: "R_thumb",
+    23: "L_hip", 24: "R_hip", 25: "L_knee", 26: "R_knee",
+    27: "L_ankle", 28: "R_ankle", 29: "L_heel", 30: "R_heel", 31: "L_foot", 32: "R_foot",
+}
+# Driver joint index -> label (for 3D driver dots)
+DRIVER_JOINT_LABELS = {
+    11: "L_shoulder", 12: "R_shoulder", 13: "L_elbow", 14: "R_elbow",
+    15: "L_wrist", 16: "R_wrist",
+    23: "L_hip", 24: "R_hip", 25: "L_knee", 26: "R_knee", 27: "L_ankle", 28: "R_ankle",
+}
 
 # Face landmarks for head driving (MediaPipe Face Mesh 468 indices)
 # nose_tip, left_eye, right_eye, chin, left_cheek, right_cheek
@@ -170,6 +189,18 @@ def draw_text_with_background(frame, text, position, font_scale=0.6,
     cv2.putText(frame, text, (x, y), font, font_scale, text_color, thickness)
 
 
+def draw_landmark_label(frame, text, px, py, font_scale=0.35, above=True):
+    """Draw a small label above (or below) a dot so landmarks are named by position."""
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    (tw, th), _ = cv2.getTextSize(text, font, font_scale, 1)
+    x = int(px - tw / 2)
+    y = int(py - 8) if above else int(py + th + 8)
+    y = max(th + 2, min(frame.shape[0] - 2, y))
+    x = max(2, min(frame.shape[1] - tw - 2, x))
+    cv2.rectangle(frame, (x - 2, y - th - 2), (x + tw + 2, y + 2), (0, 0, 0), -1)
+    cv2.putText(frame, text, (x, y), font, font_scale, (200, 255, 200), 1)
+
+
 def draw_connections(frame, norm_landmarks, connections, w, h,
                      dot_color=(0, 255, 0), line_color=(0, 0, 255),
                      dot_r=3, line_t=2):
@@ -196,10 +227,30 @@ good_posture_time   = 0.0
 bad_posture_time    = 0.0
 last_time           = time.time()
 bad_posture_cont    = 0.0
+_smooth_prev_joints = None   # for EMA smoothing
+_smooth_prev_head   = None
+
+
+def _blend_joints(prev, new, alpha):
+    """Blend two joint dicts (each key = [x,y,z]). new * alpha + prev * (1-alpha)."""
+    if prev is None or new is None or alpha >= 1.0:
+        return new
+    out = {}
+    for k in new:
+        if k in prev and len(prev[k]) == 3 and len(new[k]) == 3:
+            out[k] = [
+                round(alpha * new[k][0] + (1 - alpha) * prev[k][0], 4),
+                round(alpha * new[k][1] + (1 - alpha) * prev[k][1], 4),
+                round(alpha * new[k][2] + (1 - alpha) * prev[k][2], 4),
+            ]
+        else:
+            out[k] = new[k]
+    return out
 
 
 def detection_loop():
     global good_posture_time, bad_posture_time, last_time, bad_posture_cont
+    global _smooth_prev_joints, _smooth_prev_head
 
     print("  Building pose landmarker...")
     pose_det = mp_vision.PoseLandmarker.create_from_options(
@@ -278,8 +329,12 @@ def detection_loop():
             angle    = calculate_angle(ear, shoulder, hip)
 
             if CONFIG["show_skeleton"]:
-                draw_connections(frame, lm, POSE_CONNECTIONS, w, h,
-                                 dot_color=(0, 255, 0), line_color=(0, 255, 0))
+                pts = draw_connections(frame, lm, POSE_CONNECTIONS, w, h,
+                                       dot_color=(0, 255, 0), line_color=(0, 255, 0))
+                if CONFIG.get("show_landmark_labels") and pts is not None:
+                    for idx, (px, py) in enumerate(pts):
+                        if idx in POSE_LANDMARK_NAMES:
+                            draw_landmark_label(frame, POSE_LANDMARK_NAMES[idx], px, py, font_scale=0.28, above=True)
             for pt in [ear, shoulder, hip]:
                 cv2.circle(frame, (int(pt[0]), int(pt[1])), 8, (255, 0, 0), -1)  # blue for posture points
 
@@ -290,6 +345,8 @@ def detection_loop():
                     py = int(lm[idx].y * h)
                     cv2.circle(frame, (px, py), 10, (0, 255, 255), -1)   # fill: cyan
                     cv2.circle(frame, (px, py), 10, (255, 255, 0), 2)   # outline: yellow
+                    if CONFIG.get("show_landmark_labels") and idx in DRIVER_JOINT_LABELS:
+                        draw_landmark_label(frame, DRIVER_JOINT_LABELS[idx], px, py, above=True)
 
             if CONFIG["good_posture_min_angle"] <= angle <= CONFIG["good_posture_max_angle"]:
                 good_posture_time += elapsed
@@ -319,6 +376,8 @@ def detection_loop():
                         px, py = int(p.x * w), int(p.y * h)
                         cv2.circle(frame, (px, py), 3, (255, 180, 100), -1)   # fill: orange (small)
                         cv2.circle(frame, (px, py), 3, (255, 200, 0), 1)     # outline
+                        if CONFIG.get("show_landmark_labels"):
+                            draw_landmark_label(frame, name, px, py, font_scale=0.3, above=(name != "chin"))
 
         # ---- Hands ----
         hand_landmarks_payload = None
@@ -334,22 +393,26 @@ def detection_loop():
                     hand_lm = hand_res.hand_landmarks[j]
                     handedness = "Left"
                     if hand_res.handedness and j < len(hand_res.handedness):
-                        h = hand_res.handedness[j]
-                        if getattr(h, "classification", None) and len(h.classification):
-                            handedness = h.classification[0].display_name
-                        elif isinstance(h, (list, tuple)) and len(h):
-                            handedness = getattr(h[0], "display_name", handedness)
+                        hd = hand_res.handedness[j]
+                        if getattr(hd, "classification", None) and len(hd.classification):
+                            handedness = hd.classification[0].display_name
+                        elif isinstance(hd, (list, tuple)) and len(hd):
+                            handedness = getattr(hd[0], "display_name", handedness)
                     hand_landmarks_payload.append({
                         "handedness": handedness,
                         "landmarks": [[round(p.x, 4), round(p.y, 4), round(p.z, 4)] for p in hand_lm],
                     })
+                    if CONFIG.get("show_landmark_labels") and len(hand_lm) > 0:
+                        wx, wy = int(hand_lm[0].x * w), int(hand_lm[0].y * h)
+                        label = "L_hand" if handedness == "Left" else "R_hand"
+                        draw_landmark_label(frame, label, wx, wy, font_scale=0.35, above=True)
         # Serialize pose (33 points) and driver joints (arms + legs) and head_joints (face)
         pose_landmarks = None
-        driver_joints = None
+        driver_joints_raw = None
         if pose_res.pose_landmarks:
             lm = pose_res.pose_landmarks[0]
             pose_landmarks = [[round(lm[i].x, 4), round(lm[i].y, 4), round(lm[i].z, 4)] for i in range(33)]
-            driver_joints = {
+            driver_joints_raw = {
                 "left_shoulder":  [round(lm[11].x, 4), round(lm[11].y, 4), round(lm[11].z, 4)],
                 "right_shoulder": [round(lm[12].x, 4), round(lm[12].y, 4), round(lm[12].z, 4)],
                 "left_elbow":     [round(lm[13].x, 4), round(lm[13].y, 4), round(lm[13].z, 4)],
@@ -363,6 +426,14 @@ def detection_loop():
                 "left_ankle":     [round(lm[27].x, 4), round(lm[27].y, 4), round(lm[27].z, 4)],
                 "right_ankle":    [round(lm[28].x, 4), round(lm[28].y, 4), round(lm[28].z, 4)],
             }
+        alpha = CONFIG.get("pose_smoothing_alpha", 0.35)
+        driver_joints = _blend_joints(_smooth_prev_joints, driver_joints_raw, alpha) if driver_joints_raw else _smooth_prev_joints
+        head_smoothed = _blend_joints(_smooth_prev_head, head_joints, alpha) if head_joints else _smooth_prev_head
+        if driver_joints_raw is not None:
+            _smooth_prev_joints = driver_joints
+        if head_joints is not None:
+            _smooth_prev_head = head_smoothed
+        head_to_send = head_smoothed if head_smoothed is not None else _smooth_prev_head
 
         shared.set_posture({
             "angle":           round(angle, 1),
@@ -373,7 +444,7 @@ def detection_loop():
             "posture_type":    posture_type,
             "pose_landmarks":  pose_landmarks,
             "driver_joints":   driver_joints,
-            "head_joints":     head_joints,
+            "head_joints":     head_to_send,
             "hand_landmarks":  hand_landmarks_payload,
         })
 
@@ -803,6 +874,20 @@ PAGE_HTML = """<!DOCTYPE html>
   }
 
   let lastAngle = null;
+  let smoothJoints = null;
+  let smoothHead = null;
+  const SMOOTH_ALPHA = 0.28;
+  function blendJoints(prev, next, alpha) {
+    if (!next) return prev;
+    if (!prev) return next;
+    const out = {};
+    for (const k of Object.keys(next)) {
+      if (prev[k] && prev[k].length === 3 && next[k].length === 3)
+        out[k] = [prev[k][0] * (1 - alpha) + next[k][0] * alpha, prev[k][1] * (1 - alpha) + next[k][1] * alpha, prev[k][2] * (1 - alpha) + next[k][2] * alpha];
+      else out[k] = next[k];
+    }
+    return out;
+  }
   const evtSource = new EventSource('/posture_events');
   evtSource.onmessage = e => {
     try {
@@ -811,7 +896,9 @@ PAGE_HTML = """<!DOCTYPE html>
       const d = JSON.parse(raw);
       lastAngle = d.angle;
       updatePosture(d.angle, d.good_posture, d.status);
-      applyPose(d);
+      smoothJoints = blendJoints(smoothJoints, d.driver_joints, SMOOTH_ALPHA);
+      smoothHead = blendJoints(smoothHead, d.head_joints, SMOOTH_ALPHA);
+      applyPose({ ...d, driver_joints: smoothJoints, head_joints: smoothHead });
     } catch (_) {}
   };
   evtSource.onerror = () => updatePosture(lastAngle, false, 'Reconnecting…');
