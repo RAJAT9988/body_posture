@@ -76,7 +76,7 @@ CONFIG = {
     "show_skeleton": True,
     "show_angles": True,
     "show_statistics": True,
-    "mirror_mode": True,
+    "mirror_mode": False,
     "show_landmark_labels": True,   # draw names next to pose/face/hand dots
     "detection_confidence": 0.6,    # higher = more stable, fewer false detections (pose/hand/face)
     "pose_smoothing_alpha": 0.35,   # blend: 0=very smooth, 1=raw; lower = calmer 3D motion
@@ -606,8 +606,11 @@ PAGE_HTML = """<!DOCTYPE html>
   const restBoneQuats = {};
   const _v1 = new THREE.Vector3();
   const _v2 = new THREE.Vector3();
+  const _v3 = new THREE.Vector3();
+  const _v4 = new THREE.Vector3();
   const _quat = new THREE.Quaternion();
   const _quat2 = new THREE.Quaternion();
+  const _restAxisY = new THREE.Vector3(0, 1, 0);
 
   function vecFromLandmark(p) {
     return new THREE.Vector3((p[0] - 0.5) * 2, (0.5 - p[1]) * 2, -p[2]);
@@ -633,6 +636,22 @@ PAGE_HTML = """<!DOCTYPE html>
       if (best) return best;
     }
     return null;
+  }
+
+  // Drive one bone so it points along targetDir (world). Uses rig rest pose in parent space.
+  function pointBoneAlong(bone, targetDirWorld, restLocalAxis) {
+    if (!bone || !bone.parent || !restBoneQuats[bone.name]) return;
+    const restQ = restBoneQuats[bone.name];
+    _v3.copy(restLocalAxis).applyQuaternion(restQ);
+    bone.parent.getWorldQuaternion(_quat2).invert();
+    _v4.copy(targetDirWorld).applyQuaternion(_quat2);
+    if (_v4.lengthSq() < 1e-8) return;
+    _v4.normalize();
+    if (_v3.lengthSq() < 1e-8) return;
+    _v3.normalize();
+    if (_v3.dot(_v4) < 0) _v3.negate();
+    _quat.setFromUnitVectors(_v3, _v4);
+    bone.quaternion.slerp(_quat, 0.25);
   }
 
   function applyPose(data) {
@@ -676,67 +695,25 @@ PAGE_HTML = """<!DOCTYPE html>
 
     if (ls && le && leftUpper) {
       _v2.subVectors(le, ls);
-      if (_v2.lengthSq() > 1e-6) { _v2.normalize(); _v1.set(-1, 0, 0); _quat.setFromUnitVectors(_v1, _v2); leftUpper.quaternion.slerp(_quat, 0.25); }
+      if (_v2.lengthSq() > 1e-6) { _v2.normalize(); pointBoneAlong(leftUpper, _v2, _restAxisY); }
     }
     if (le && lw && leftFore) {
       _v2.subVectors(lw, le);
-      if (_v2.lengthSq() > 1e-6) { _v2.normalize(); _v1.set(0, -1, 0); _quat.setFromUnitVectors(_v1, _v2); leftFore.quaternion.slerp(_quat, 0.25); }
+      if (_v2.lengthSq() > 1e-6) { _v2.normalize(); pointBoneAlong(leftFore, _v2, _restAxisY); }
     }
     if (rs && re && rightUpper) {
       _v2.subVectors(re, rs);
-      if (_v2.lengthSq() > 1e-6) { _v2.normalize(); _v1.set(1, 0, 0); _quat.setFromUnitVectors(_v1, _v2); rightUpper.quaternion.slerp(_quat, 0.25); }
+      if (_v2.lengthSq() > 1e-6) { _v2.normalize(); pointBoneAlong(rightUpper, _v2, _restAxisY); }
     }
     if (re && rw && rightFore) {
       _v2.subVectors(rw, re);
-      if (_v2.lengthSq() > 1e-6) { _v2.normalize(); _v1.set(0, -1, 0); _quat.setFromUnitVectors(_v1, _v2); rightFore.quaternion.slerp(_quat, 0.25); }
+      if (_v2.lengthSq() > 1e-6) { _v2.normalize(); pointBoneAlong(rightFore, _v2, _restAxisY); }
     }
 
-    if (ls && rs && lh && rh) {
-      const midShoulder = new THREE.Vector3().addVectors(ls, rs).multiplyScalar(0.5);
-      const midHip = new THREE.Vector3().addVectors(lh, rh).multiplyScalar(0.5);
-      const torsoUp = _v1.subVectors(midShoulder, midHip).normalize();
-      const shoulderLine = _v2.subVectors(rs, ls).normalize();
-      const torsoForward = new THREE.Vector3().crossVectors(shoulderLine, torsoUp).normalize();
-      if (torsoForward.lengthSq() < 1e-6) torsoForward.set(0, 0, 1);
-      const torsoRight = new THREE.Vector3().crossVectors(torsoUp, torsoForward).normalize();
-      const spineMat = new THREE.Matrix4();
-      spineMat.set(
-        torsoRight.x, torsoRight.y, torsoRight.z, 0,
-        torsoUp.x, torsoUp.y, torsoUp.z, 0,
-        torsoForward.x, torsoForward.y, torsoForward.z, 0,
-        0, 0, 0, 1
-      );
-      _quat.setFromRotationMatrix(spineMat);
-      const spineBone = spine || spine1 || chest;
-      if (spineBone) spineBone.quaternion.slerp(_quat, 0.2);
-      if (spine1 && spine1 !== spineBone) spine1.quaternion.slerp(_quat, 0.15);
-      if (chest && chest !== spineBone && chest !== spine1) chest.quaternion.slerp(_quat, 0.15);
-    }
+    // Keep torso/stomach static: do not drive spine/chest from pose.
 
-    if (lh && lk && leftThigh) {
-      _v2.subVectors(lk, lh);
-      if (_v2.lengthSq() > 1e-6) { _v2.normalize(); _v1.set(0, -1, 0); _quat.setFromUnitVectors(_v1, _v2); leftThigh.quaternion.slerp(_quat, 0.25); }
-    }
-    if (lk && la && leftCalf) {
-      _v2.subVectors(la, lk);
-      if (_v2.lengthSq() > 1e-6) { _v2.normalize(); _v1.set(0, -1, 0); _quat.setFromUnitVectors(_v1, _v2); leftCalf.quaternion.slerp(_quat, 0.25); }
-    }
-    if (rh && rk && rightThigh) {
-      _v2.subVectors(rk, rh);
-      if (_v2.lengthSq() > 1e-6) { _v2.normalize(); _v1.set(0, -1, 0); _quat.setFromUnitVectors(_v1, _v2); rightThigh.quaternion.slerp(_quat, 0.25); }
-    }
-    if (rk && ra && rightCalf) {
-      _v2.subVectors(ra, rk);
-      if (_v2.lengthSq() > 1e-6) { _v2.normalize(); _v1.set(0, -1, 0); _quat.setFromUnitVectors(_v1, _v2); rightCalf.quaternion.slerp(_quat, 0.25); }
-    }
-    if (la && lk && leftFoot) {
-      _v2.subVectors(la, lk).normalize();
-      if (_v2.lengthSq() > 1e-6) { _v1.set(0, 1, 0); _quat.setFromUnitVectors(_v1, _v2); leftFoot.quaternion.slerp(_quat, 0.15); }
-    }
-    if (ra && rk && rightFoot) {
-      _v2.subVectors(ra, rk).normalize();
-      if (_v2.lengthSq() > 1e-6) { _v1.set(0, 1, 0); _quat.setFromUnitVectors(_v1, _v2); rightFoot.quaternion.slerp(_quat, 0.15); }
-    }
+    // Legs are intentionally kept in their default/bind pose.
+    // We do not drive thigh/calf/foot bones from pose landmarks so the legs stay still.
 
     const nose = headJoints.nose && webcamTo3D(headJoints.nose);
     const leftEye = headJoints.left_eye && webcamTo3D(headJoints.left_eye);
@@ -781,12 +758,15 @@ PAGE_HTML = """<!DOCTYPE html>
       head.quaternion.slerp(_quat, 0.2);
     }
 
+    // Assign hands by position in image: same-to-same with detection.
+    // Left side of image (wrist x < 0.5) = person's right hand → drive rightHand.
+    // Right side of image (wrist x >= 0.5) = person's left hand → drive leftHand.
     for (const hand of hands) {
       const lm = hand.landmarks;
       if (!lm || lm.length < 10) continue;
-      const handedness = (hand.handedness || '').toLowerCase();
-      const isLeft = handedness === 'left';
-      const bone = isLeft ? leftHand : rightHand;
+      const wristX = lm[0][0];
+      const isPersonRightHand = wristX < 0.5;
+      const bone = isPersonRightHand ? rightHand : leftHand;
       if (!bone) continue;
       const wrist = webcamTo3D(lm[0]);
       const midBase = webcamTo3D(lm[9]);
@@ -796,7 +776,7 @@ PAGE_HTML = """<!DOCTYPE html>
       alignDirectionTo3DScreen(_v1);
       alignDirectionTo3DScreen(_v2);
       const palmNormal = new THREE.Vector3().crossVectors(_v1, _v2).normalize();
-      if (isLeft) palmNormal.negate();
+      if (isPersonRightHand) palmNormal.negate();
       alignDirectionTo3DScreen(palmNormal);
       _v1.set(0, 0, -1);
       _quat.setFromUnitVectors(_v1, palmNormal);
@@ -840,7 +820,8 @@ PAGE_HTML = """<!DOCTYPE html>
     const hasSkel = !!(avatarSkeleton && (avatarSkeleton.bones || avatarSkeleton).length);
     console.log('Avatar loaded: ' + nBones + ' bones, skeleton: ' + hasSkel);
     console.log('Bone names:', Object.keys(boneByName).sort().join(', '));
-    model.rotation.y = Math.PI;
+    // Keep model in its original facing direction; arms/torso logic already assumes camera-facing coordinates.
+    model.rotation.y = 0;
     model.position.set(0, 0, 0);
     model.scale.setScalar(1);
     model.updateMatrixWorld(true);
