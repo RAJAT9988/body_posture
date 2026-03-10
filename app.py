@@ -813,9 +813,50 @@ PAGE_HTML = """<!DOCTYPE html>
       rightFore.quaternion.slerp(restBoneQuats[rightFore.name], 0.25);
     }
 
-    // Torso, head, and legs: keep static for now while focusing on the right arm.
+    // Torso and legs: keep static (no spine/hip driving).
 
-    // Head/neck: keep at bind pose for now (no face driving).
+    // Head/neck: drive from face landmarks (nose/eyes/chin), allowing left/right
+    // rotation but clamping so the head never flips backwards.
+    const nose = headJoints.nose && webcamTo3D(headJoints.nose);
+    const leftEye = headJoints.left_eye && webcamTo3D(headJoints.left_eye);
+    const rightEye = headJoints.right_eye && webcamTo3D(headJoints.right_eye);
+    const chin = headJoints.chin && webcamTo3D(headJoints.chin);
+    if ((neck || head) && (nose || chin) && (leftEye || rightEye)) {
+      // Use nose→chin as \"up\" direction for the head.
+      const headUp = (nose && chin) ? _v1.subVectors(nose, chin).normalize() : new THREE.Vector3(0, 1, 0);
+      const eyeMid = (leftEye && rightEye)
+        ? new THREE.Vector3().addVectors(leftEye, rightEye).multiplyScalar(0.5)
+        : (leftEye || rightEye || nose || chin);
+      let headForward = (nose && eyeMid) ? _v2.subVectors(nose, eyeMid).normalize() : new THREE.Vector3(0, 0, -1);
+      if (headForward.lengthSq() < 1e-6) headForward.set(0, 0, -1);
+      // Map from webcam to 3D space.
+      alignDirectionTo3DScreen(headUp);
+      alignDirectionTo3DScreen(headForward);
+      // Clamp so head never points backwards (z >= 0) and only allows moderate up/down.
+      const MAX_UP_TILT = 0.6;
+      const MAX_DOWN_TILT = 0.6;
+      if (headForward.y > MAX_UP_TILT) headForward.y = MAX_UP_TILT;
+      if (headForward.y < -MAX_DOWN_TILT) headForward.y = -MAX_DOWN_TILT;
+      if (headForward.z > -0.15) headForward.z = -0.15;  // always at least slightly facing camera
+      headForward.normalize();
+      // Build an orthonormal basis from up + forward (with yaw still preserved).
+      const headRight = new THREE.Vector3().crossVectors(headUp, headForward).normalize();
+      headForward.crossVectors(headRight, headUp).normalize();
+      const headMat = new THREE.Matrix4();
+      headMat.set(
+        headRight.x, headRight.y, headRight.z, 0,
+        headUp.x, headUp.y, headUp.z, 0,
+        headForward.x, headForward.y, headForward.z, 0,
+        0, 0, 0, 1
+      );
+      _quat.setFromRotationMatrix(headMat);
+      // Smaller slerp factors = smoother, less sensitive head motion.
+      if (neck && restBoneQuats[neck.name]) neck.quaternion.slerp(_quat, 0.1);
+      if (head && restBoneQuats[head.name]) head.quaternion.slerp(_quat, 0.5);
+    } else {
+      if (neck && restBoneQuats[neck.name]) neck.quaternion.slerp(restBoneQuats[neck.name], 0.22);
+      if (head && restBoneQuats[head.name]) head.quaternion.slerp(restBoneQuats[head.name], 0.22);
+    }
 
     // Keep right hand in bind pose for now (no wrist orientation).
     if (rightHand && restBoneQuats[rightHand.name]) {
