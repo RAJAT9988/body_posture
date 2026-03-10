@@ -350,12 +350,9 @@ def detection_loop():
             angle    = calculate_angle(ear, shoulder, hip)
 
             if CONFIG["show_skeleton"]:
+                # Only draw dots/lines for skeleton; skip text labels for performance.
                 pts = draw_connections(frame, lm, POSE_CONNECTIONS, w, h,
                                        dot_color=(0, 255, 0), line_color=(0, 255, 0))
-                if CONFIG.get("show_landmark_labels") and pts is not None:
-                    for idx, (px, py) in enumerate(pts):
-                        if idx in POSE_LANDMARK_NAMES:
-                            draw_landmark_label(frame, POSE_LANDMARK_NAMES[idx], px, py, font_scale=0.28, above=True)
             for pt in [ear, shoulder, hip]:
                 cv2.circle(frame, (int(pt[0]), int(pt[1])), 8, (255, 0, 0), -1)  # blue for posture points
 
@@ -366,8 +363,6 @@ def detection_loop():
                     py = int(lm[idx].y * h)
                     cv2.circle(frame, (px, py), 10, (0, 255, 255), -1)   # fill: cyan
                     cv2.circle(frame, (px, py), 10, (255, 255, 0), 2)   # outline: yellow
-                    if CONFIG.get("show_landmark_labels") and idx in DRIVER_JOINT_LABELS:
-                        draw_landmark_label(frame, DRIVER_JOINT_LABELS[idx], px, py, above=True)
 
             if CONFIG["good_posture_min_angle"] <= angle <= CONFIG["good_posture_max_angle"]:
                 good_posture_time += elapsed
@@ -399,15 +394,7 @@ def detection_loop():
                     right_dir = _hand_move_direction(dx, dy, _HAND_MOVE_THRESH)
                 _prev_left_wrist = left_wrist_cur
                 _prev_right_wrist = right_wrist_cur
-                # Draw direction labels on the frame
-                lx = int(lm[15].x * w)
-                ly = int(lm[15].y * h)
-                rx = int(lm[16].x * w)
-                ry = int(lm[16].y * h)
-                draw_text_with_background(frame, f"L: {left_dir}", (max(10, lx - 40), max(24, ly - 25)),
-                                          font_scale=0.55, text_color=(255, 255, 0), bg_color=(0, 80, 0))
-                draw_text_with_background(frame, f"R: {right_dir}", (min(w - 120, rx - 40), max(24, ry - 25)),
-                                          font_scale=0.55, text_color=(255, 255, 0), bg_color=(80, 0, 0))
+                # Skip drawing text labels on the frame to keep streaming smooth.
         else:
             _prev_left_wrist = None
             _prev_right_wrist = None
@@ -426,8 +413,6 @@ def detection_loop():
                         px, py = int(p.x * w), int(p.y * h)
                         cv2.circle(frame, (px, py), 3, (255, 180, 100), -1)   # fill: orange (small)
                         cv2.circle(frame, (px, py), 3, (255, 200, 0), 1)     # outline
-                        if CONFIG.get("show_landmark_labels"):
-                            draw_landmark_label(frame, name, px, py, font_scale=0.3, above=(name != "chin"))
 
         # ---- Hands ----
         hand_landmarks_payload = None
@@ -452,10 +437,6 @@ def detection_loop():
                         "handedness": handedness,
                         "landmarks": [[round(p.x, 4), round(p.y, 4), round(p.z, 4)] for p in hand_lm],
                     })
-                    if CONFIG.get("show_landmark_labels") and len(hand_lm) > 0:
-                        wx, wy = int(hand_lm[0].x * w), int(hand_lm[0].y * h)
-                        label = "L_hand" if handedness == "Left" else "R_hand"
-                        draw_landmark_label(frame, label, wx, wy, font_scale=0.35, above=True)
         # Serialize pose (33 points) and driver joints (arms + legs) and head_joints (face)
         pose_landmarks = None
         driver_joints_raw = None
@@ -498,9 +479,11 @@ def detection_loop():
             "hand_landmarks":  hand_landmarks_payload,
         })
 
-        _, jpeg = cv2.imencode(".jpg", frame)
+        # Encode a slightly compressed JPEG to keep streaming smooth and lightweight.
+        _, jpeg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
         shared.set_frame(jpeg.tobytes())
-        time.sleep(0.02)
+        # Small sleep to avoid maxing out CPU; keep it short for low latency.
+        time.sleep(0.005)
 
     cap.release()
     pose_det.close()
@@ -994,7 +977,8 @@ def video_feed():
             else:
                 yield (b"--" + boundary + b"\r\n"
                        b"Content-Type: image/jpeg\r\nContent-Length: 0\r\n\r\n\r\n")
-            time.sleep(0.03)
+            # Keep this small so the stream can update as soon as new frames are available.
+            time.sleep(0.01)
 
     return Response(
         generate(),
