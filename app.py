@@ -79,7 +79,7 @@ CONFIG = {
     "mirror_mode": False,
     "show_landmark_labels": True,   # draw names next to pose/face/hand dots
     "detection_confidence": 0.6,    # higher = more stable, fewer false detections (pose/hand/face)
-    "pose_smoothing_alpha": 0.35,   # blend: 0=very smooth, 1=raw; lower = calmer 3D motion
+    "pose_smoothing_alpha": 0.55,   # blend: higher = livelier 3D, same-to-same with detection
 }
 
 # ==================== LANDMARK TOPOLOGY ====================
@@ -229,6 +229,26 @@ last_time           = time.time()
 bad_posture_cont    = 0.0
 _smooth_prev_joints = None   # for EMA smoothing
 _smooth_prev_head   = None
+_prev_left_wrist    = None  # (x, y) normalized for hand movement direction
+_prev_right_wrist   = None
+_HAND_MOVE_THRESH   = 0.008  # min normalized delta to show direction
+_HAND_MOVE_SMOOTH   = 0.25   # blend for smoothing movement
+
+
+def _hand_move_direction(dx, dy, thresh):
+    """Return direction string from normalized deltas. y down = positive dy."""
+    if abs(dx) < thresh and abs(dy) < thresh:
+        return "Still"
+    parts = []
+    if dy < -thresh:
+        parts.append("Up")
+    elif dy > thresh:
+        parts.append("Down")
+    if dx < -thresh:
+        parts.append("Left")
+    elif dx > thresh:
+        parts.append("Right")
+    return "-".join(parts) if parts else "Still"
 
 
 def _blend_joints(prev, new, alpha):
@@ -251,6 +271,7 @@ def _blend_joints(prev, new, alpha):
 def detection_loop():
     global good_posture_time, bad_posture_time, last_time, bad_posture_cont
     global _smooth_prev_joints, _smooth_prev_head
+    global _prev_left_wrist, _prev_right_wrist
 
     print("  Building pose landmarker...")
     pose_det = mp_vision.PoseLandmarker.create_from_options(
@@ -361,6 +382,35 @@ def detection_loop():
                 good_posture = False
                 if bad_posture_cont >= CONFIG["bad_posture_alert_delay"] and CONFIG["enable_visual_alert"]:
                     pass  # visual alert disabled: no red border on webcam
+
+            # Hand movement direction (Up, Down, Left, Right, etc.) from wrist motion
+            if len(lm) >= 17:
+                left_wrist_cur = (lm[15].x, lm[15].y)
+                right_wrist_cur = (lm[16].x, lm[16].y)
+                left_dir = "Still"
+                right_dir = "Still"
+                if _prev_left_wrist is not None:
+                    dx = left_wrist_cur[0] - _prev_left_wrist[0]
+                    dy = left_wrist_cur[1] - _prev_left_wrist[1]
+                    left_dir = _hand_move_direction(dx, dy, _HAND_MOVE_THRESH)
+                if _prev_right_wrist is not None:
+                    dx = right_wrist_cur[0] - _prev_right_wrist[0]
+                    dy = right_wrist_cur[1] - _prev_right_wrist[1]
+                    right_dir = _hand_move_direction(dx, dy, _HAND_MOVE_THRESH)
+                _prev_left_wrist = left_wrist_cur
+                _prev_right_wrist = right_wrist_cur
+                # Draw direction labels on the frame
+                lx = int(lm[15].x * w)
+                ly = int(lm[15].y * h)
+                rx = int(lm[16].x * w)
+                ry = int(lm[16].y * h)
+                draw_text_with_background(frame, f"L: {left_dir}", (max(10, lx - 40), max(24, ly - 25)),
+                                          font_scale=0.55, text_color=(255, 255, 0), bg_color=(0, 80, 0))
+                draw_text_with_background(frame, f"R: {right_dir}", (min(w - 120, rx - 40), max(24, ry - 25)),
+                                          font_scale=0.55, text_color=(255, 255, 0), bg_color=(80, 0, 0))
+        else:
+            _prev_left_wrist = None
+            _prev_right_wrist = None
 
         # ---- Face: driver dots for head (3D model)
         head_joints = None
@@ -611,9 +661,15 @@ PAGE_HTML = """<!DOCTYPE html>
   const _quat = new THREE.Quaternion();
   const _quat2 = new THREE.Quaternion();
   const _restAxisY = new THREE.Vector3(0, 1, 0);
+  const _restAxisLeft = new THREE.Vector3(-1, 0, 0);   // left shoulder "out" from torso
+  const _restAxisRight = new THREE.Vector3(1, 0, 0);    // right shoulder "out" from torso
 
   function vecFromLandmark(p) {
     return new THREE.Vector3((p[0] - 0.5) * 2, (0.5 - p[1]) * 2, -p[2]);
+  }
+  // Arm joints: use z = p[2] so "toward camera" (negative p[2]) = front in 3D; fixes front/back inversion.
+  function vecFromLandmarkArm(p) {
+    return new THREE.Vector3((p[0] - 0.5) * 2, (0.5 - p[1]) * 2, (p[2] != null ? p[2] : 0));
   }
 
   function webcamTo3D(p) {
@@ -639,8 +695,9 @@ PAGE_HTML = """<!DOCTYPE html>
   }
 
   // Drive one bone so it points along targetDir (world). Uses rig rest pose in parent space.
-  function pointBoneAlong(bone, targetDirWorld, restLocalAxis) {
+  function pointBoneAlong(bone, targetDirWorld, restLocalAxis, slerpAmount) {
     if (!bone || !bone.parent || !restBoneQuats[bone.name]) return;
+    const blend = slerpAmount != null ? slerpAmount : 0.3;
     const restQ = restBoneQuats[bone.name];
     _v3.copy(restLocalAxis).applyQuaternion(restQ);
     bone.parent.getWorldQuaternion(_quat2).invert();
@@ -651,7 +708,7 @@ PAGE_HTML = """<!DOCTYPE html>
     _v3.normalize();
     if (_v3.dot(_v4) < 0) _v3.negate();
     _quat.setFromUnitVectors(_v3, _v4);
-    bone.quaternion.slerp(_quat, 0.25);
+    bone.quaternion.slerp(_quat, blend);
   }
 
   function applyPose(data) {
@@ -662,10 +719,12 @@ PAGE_HTML = """<!DOCTYPE html>
     if (!joints) return;
     if (!avatarSkeleton && Object.keys(boneByName).length === 0) return;
 
-    const leftUpper = findBoneByNames(['LeftUpperArm', 'LeftArm', 'mixamorigLeftArm', 'mixamorig:LeftArm', 'Arm_L', 'upper_arm_l', 'Left arm', 'left_upper_arm', 'L_UpperArm', 'LeftShoulder', 'Shoulder_L', 'upper_arm.L', 'CC_Base_L_Upperarm']);
+    const leftShoulderBone = findBoneByNames(['LeftShoulder', 'mixamorigLeftShoulder', 'mixamorig:LeftShoulder']);
+    const rightShoulderBone = findBoneByNames(['RightShoulder', 'mixamorigRightShoulder', 'mixamorig:RightShoulder']);
+    const leftUpper = findBoneByNames(['LeftUpperArm', 'LeftArm', 'mixamorigLeftArm', 'mixamorig:LeftArm', 'Arm_L', 'upper_arm_l', 'Left arm', 'left_upper_arm', 'L_UpperArm', 'Shoulder_L', 'upper_arm.L', 'CC_Base_L_Upperarm']);
     const leftFore = findBoneByNames(['LeftLowerArm', 'LeftForeArm', 'mixamorigLeftForeArm', 'mixamorig:LeftForeArm', 'ForeArm_L', 'forearm_l', 'Left forearm', 'left_lower_arm', 'L_ForeArm', 'Forearm_L', 'lower_arm.L', 'CC_Base_L_Forearm']);
     const leftHand = findBoneByNames(['LeftHand', 'mixamorigLeftHand', 'mixamorig:LeftHand', 'Hand_L', 'hand_l', 'left_hand', 'Left hand', 'Wrist_L', 'wrist_l', 'CC_Base_L_Hand']);
-    const rightUpper = findBoneByNames(['RightUpperArm', 'RightArm', 'mixamorigRightArm', 'mixamorig:RightArm', 'Arm_R', 'upper_arm_r', 'Right arm', 'right_upper_arm', 'R_UpperArm', 'RightShoulder', 'Shoulder_R', 'upper_arm.R', 'CC_Base_R_Upperarm']);
+    const rightUpper = findBoneByNames(['RightUpperArm', 'RightArm', 'mixamorigRightArm', 'mixamorig:RightArm', 'Arm_R', 'upper_arm_r', 'Right arm', 'right_upper_arm', 'R_UpperArm', 'Shoulder_R', 'upper_arm.R', 'CC_Base_R_Upperarm']);
     const rightFore = findBoneByNames(['RightLowerArm', 'RightForeArm', 'mixamorigRightForeArm', 'mixamorig:RightForeArm', 'ForeArm_R', 'forearm_r', 'Right forearm', 'right_lower_arm', 'R_ForeArm', 'Forearm_R', 'lower_arm.R', 'CC_Base_R_Forearm']);
     const rightHand = findBoneByNames(['RightHand', 'mixamorigRightHand', 'mixamorig:RightHand', 'Hand_R', 'hand_r', 'right_hand', 'Right hand', 'Wrist_R', 'wrist_r', 'CC_Base_R_Hand']);
     const spine = findBoneByNames(['Spine', 'spine', 'mixamorigSpine', 'mixamorig:Spine', 'spine_01', 'CC_Base_Spine', 'Torso', 'torso']);
@@ -680,12 +739,12 @@ PAGE_HTML = """<!DOCTYPE html>
     const leftFoot = findBoneByNames(['LeftFoot', 'LeftToeBase', 'mixamorigLeftFoot', 'mixamorig:LeftFoot', 'Foot_L', 'foot_l', 'CC_Base_L_Foot']);
     const rightFoot = findBoneByNames(['RightFoot', 'RightToeBase', 'mixamorigRightFoot', 'mixamorig:RightFoot', 'Foot_R', 'foot_r', 'CC_Base_R_Foot']);
 
-    const ls = joints.left_shoulder && vecFromLandmark(joints.left_shoulder);
-    const le = joints.left_elbow && vecFromLandmark(joints.left_elbow);
-    const lw = joints.left_wrist && vecFromLandmark(joints.left_wrist);
-    const rs = joints.right_shoulder && vecFromLandmark(joints.right_shoulder);
-    const re = joints.right_elbow && vecFromLandmark(joints.right_elbow);
-    const rw = joints.right_wrist && vecFromLandmark(joints.right_wrist);
+    const ls = joints.left_shoulder && vecFromLandmarkArm(joints.left_shoulder);
+    const le = joints.left_elbow && vecFromLandmarkArm(joints.left_elbow);
+    const lw = joints.left_wrist && vecFromLandmarkArm(joints.left_wrist);
+    const rs = joints.right_shoulder && vecFromLandmarkArm(joints.right_shoulder);
+    const re = joints.right_elbow && vecFromLandmarkArm(joints.right_elbow);
+    const rw = joints.right_wrist && vecFromLandmarkArm(joints.right_wrist);
     const lh = joints.left_hip && vecFromLandmark(joints.left_hip);
     const rh = joints.right_hip && vecFromLandmark(joints.right_hip);
     const lk = joints.left_knee && vecFromLandmark(joints.left_knee);
@@ -693,94 +752,74 @@ PAGE_HTML = """<!DOCTYPE html>
     const la = joints.left_ankle && vecFromLandmark(joints.left_ankle);
     const ra = joints.right_ankle && vecFromLandmark(joints.right_ankle);
 
-    if (ls && le && leftUpper) {
-      _v2.subVectors(le, ls);
-      if (_v2.lengthSq() > 1e-6) { _v2.normalize(); pointBoneAlong(leftUpper, _v2, _restAxisY); }
+    // For now we only drive the RIGHT side; keep the rest of the avatar static in its bind pose.
+    const leftInFront = false;
+    const rightInFront = true;
+    const armBlend = 0.58;
+    function clampToFrontHalfSpace(v) {
+      if (v.z > 0) v.z = 0;
     }
-    if (le && lw && leftFore) {
-      _v2.subVectors(lw, le);
-      if (_v2.lengthSq() > 1e-6) { _v2.normalize(); pointBoneAlong(leftFore, _v2, _restAxisY); }
+    function clampDirToFront(dir) {
+      if (dir.z > 0) { dir.z = 0; dir.normalize(); }
     }
-    if (rs && re && rightUpper) {
-      _v2.subVectors(re, rs);
-      if (_v2.lengthSq() > 1e-6) { _v2.normalize(); pointBoneAlong(rightUpper, _v2, _restAxisY); }
+    const lsClamp = ls ? ls.clone() : null;
+    const leClamp = le ? le.clone() : null;
+    const lwClamp = lw ? lw.clone() : null;
+    const rsClamp = rs ? rs.clone() : null;
+    const reClamp = re ? re.clone() : null;
+    const rwClamp = rw ? rw.clone() : null;
+    if (lsClamp) clampToFrontHalfSpace(lsClamp);
+    if (leClamp) clampToFrontHalfSpace(leClamp);
+    if (lwClamp) clampToFrontHalfSpace(lwClamp);
+    if (rsClamp) clampToFrontHalfSpace(rsClamp);
+    if (reClamp) clampToFrontHalfSpace(reClamp);
+    if (rwClamp) clampToFrontHalfSpace(rwClamp);
+    // Only drive RIGHT shoulder + arm from pose; keep left side at rest.
+    // Shoulder: orient from mid-shoulder toward RIGHT shoulder only.
+    const shoulderBlend = 0.52;
+    if (rs && rightShoulderBone) {
+      const midShoulder = ls ? new THREE.Vector3().addVectors(lsClamp || ls, rsClamp || rs).multiplyScalar(0.5)
+                             : (rsClamp || rs);
+      const dirRightOut = _v2.subVectors(rsClamp || rs, midShoulder).normalize();
+      if (dirRightOut.lengthSq() > 1e-6) {
+        clampDirToFront(dirRightOut);
+        pointBoneAlong(rightShoulderBone, dirRightOut, _restAxisRight, shoulderBlend);
+      } else if (restBoneQuats[rightShoulderBone.name]) {
+        rightShoulderBone.quaternion.slerp(restBoneQuats[rightShoulderBone.name], 0.2);
+      }
+    } else if (rightShoulderBone && restBoneQuats[rightShoulderBone.name]) {
+      rightShoulderBone.quaternion.slerp(restBoneQuats[rightShoulderBone.name], 0.2);
     }
-    if (re && rw && rightFore) {
-      _v2.subVectors(rw, re);
-      if (_v2.lengthSq() > 1e-6) { _v2.normalize(); pointBoneAlong(rightFore, _v2, _restAxisY); }
+    // Left shoulder/arm: always relax back to bind pose.
+    if (leftShoulderBone && restBoneQuats[leftShoulderBone.name]) {
+      leftShoulderBone.quaternion.slerp(restBoneQuats[leftShoulderBone.name], 0.25);
     }
-
-    // Keep torso/stomach static: do not drive spine/chest from pose.
-
-    // Legs are intentionally kept in their default/bind pose.
-    // We do not drive thigh/calf/foot bones from pose landmarks so the legs stay still.
-
-    const nose = headJoints.nose && webcamTo3D(headJoints.nose);
-    const leftEye = headJoints.left_eye && webcamTo3D(headJoints.left_eye);
-    const rightEye = headJoints.right_eye && webcamTo3D(headJoints.right_eye);
-    const chin = headJoints.chin && webcamTo3D(headJoints.chin);
-    if (neck && (nose || chin) && (leftEye || rightEye)) {
-      const headUp = nose && chin ? _v1.subVectors(nose, chin).normalize() : new THREE.Vector3(0, 1, 0);
-      const eyeMid = leftEye && rightEye ? new THREE.Vector3().addVectors(leftEye, rightEye).multiplyScalar(0.5) : (nose || chin);
-      const headForward = nose && eyeMid ? _v2.subVectors(nose, eyeMid).normalize() : new THREE.Vector3(0, 0, -1);
-      if (headForward.lengthSq() < 1e-6) headForward.set(0, 0, -1);
-      alignDirectionTo3DScreen(headUp);
-      alignDirectionTo3DScreen(headForward);
-      const headRight = new THREE.Vector3().crossVectors(headUp, headForward).normalize();
-      headForward.crossVectors(headRight, headUp).normalize();
-      const headMat = new THREE.Matrix4();
-      headMat.set(
-        headRight.x, headRight.y, headRight.z, 0,
-        headUp.x, headUp.y, headUp.z, 0,
-        headForward.x, headForward.y, headForward.z, 0,
-        0, 0, 0, 1
-      );
-      _quat.setFromRotationMatrix(headMat);
-      neck.quaternion.slerp(_quat, 0.2);
+    if (leftUpper && restBoneQuats[leftUpper.name]) {
+      leftUpper.quaternion.slerp(restBoneQuats[leftUpper.name], 0.25);
     }
-    if (head && (nose || chin) && (leftEye || rightEye)) {
-      const headUp = nose && chin ? _v1.subVectors(nose, chin).normalize() : new THREE.Vector3(0, 1, 0);
-      const eyeMid = leftEye && rightEye ? new THREE.Vector3().addVectors(leftEye, rightEye).multiplyScalar(0.5) : (nose || chin);
-      const headForward = nose && eyeMid ? _v2.subVectors(nose, eyeMid).normalize() : new THREE.Vector3(0, 0, -1);
-      if (headForward.lengthSq() < 1e-6) headForward.set(0, 0, -1);
-      alignDirectionTo3DScreen(headUp);
-      alignDirectionTo3DScreen(headForward);
-      const headRight = new THREE.Vector3().crossVectors(headUp, headForward).normalize();
-      headForward.crossVectors(headRight, headUp).normalize();
-      const headMat = new THREE.Matrix4();
-      headMat.set(
-        headRight.x, headRight.y, headRight.z, 0,
-        headUp.x, headUp.y, headUp.z, 0,
-        headForward.x, headForward.y, headForward.z, 0,
-        0, 0, 0, 1
-      );
-      _quat.setFromRotationMatrix(headMat);
-      head.quaternion.slerp(_quat, 0.2);
+    if (leftFore && restBoneQuats[leftFore.name]) {
+      leftFore.quaternion.slerp(restBoneQuats[leftFore.name], 0.25);
     }
 
-    // Assign hands by position in image: same-to-same with detection.
-    // Left side of image (wrist x < 0.5) = person's right hand → drive rightHand.
-    // Right side of image (wrist x >= 0.5) = person's left hand → drive leftHand.
-    for (const hand of hands) {
-      const lm = hand.landmarks;
-      if (!lm || lm.length < 10) continue;
-      const wristX = lm[0][0];
-      const isPersonRightHand = wristX < 0.5;
-      const bone = isPersonRightHand ? rightHand : leftHand;
-      if (!bone) continue;
-      const wrist = webcamTo3D(lm[0]);
-      const midBase = webcamTo3D(lm[9]);
-      const idxBase = webcamTo3D(lm[5]);
-      _v1.subVectors(midBase, wrist).normalize();
-      _v2.subVectors(idxBase, wrist).normalize();
-      alignDirectionTo3DScreen(_v1);
-      alignDirectionTo3DScreen(_v2);
-      const palmNormal = new THREE.Vector3().crossVectors(_v1, _v2).normalize();
-      if (isPersonRightHand) palmNormal.negate();
-      alignDirectionTo3DScreen(palmNormal);
-      _v1.set(0, 0, -1);
-      _quat.setFromUnitVectors(_v1, palmNormal);
-      bone.quaternion.slerp(_quat, 0.2);
+    // Right arm: drive only shoulder → upper arm (elbow). Forearm stays in bind pose.
+    if (rightInFront && rsClamp && reClamp && rightUpper) {
+      _v2.subVectors(reClamp, rsClamp);
+      if (_v2.lengthSq() > 1e-6) { _v2.normalize(); clampDirToFront(_v2); pointBoneAlong(rightUpper, _v2, _restAxisY, armBlend); }
+    } else if (rightUpper && restBoneQuats[rightUpper.name]) {
+      rightUpper.quaternion.slerp(restBoneQuats[rightUpper.name], 0.22);
+    }
+    // Always relax right forearm to its bind pose for now.
+    if (rightFore && restBoneQuats[rightFore.name]) {
+      rightFore.quaternion.slerp(restBoneQuats[rightFore.name], 0.25);
+    }
+
+    // Torso, head, and legs: keep static for now while focusing on the right arm.
+
+    // Head/neck: keep at bind pose for now (no face driving).
+
+    // Keep right hand in bind pose for now (no wrist orientation).
+    if (rightHand && restBoneQuats[rightHand.name]) {
+      rightHand.quaternion.slerp(restBoneQuats[rightHand.name], 0.25);
     }
 
     if (avatarSkeleton && typeof avatarSkeleton.update === 'function') {
@@ -790,20 +829,21 @@ PAGE_HTML = """<!DOCTYPE html>
     }
   }
 
-  const glbUrl = (window.location && window.location.origin) ? window.location.origin + '/final.glb' : '/final.glb';
+  // --- High-quality rigged character (GLB) ---
+  // Using the official three.js example Soldier model (Mixamo-style skeleton),
+  // so the avatar looks good and bones are stable for driving.
   const loader = new GLTFLoader();
-  loader.load(glbUrl, (gltf) => {
+  const MODEL_URL = 'https://threejs.org/examples/models/gltf/Soldier.glb';
+  loader.load(MODEL_URL, (gltf) => {
     const model = gltf.scene;
     avatarModel = model;
-    const maxAnisotropy = renderer.capabilities.getMaxAnisotropy();
+
+    // Reset caches
+    for (const k of Object.keys(boneByName)) delete boneByName[k];
+    for (const k of Object.keys(restBoneQuats)) delete restBoneQuats[k];
+    avatarSkeleton = null;
+
     model.traverse((o) => {
-      if (o.material) {
-        const mats = Array.isArray(o.material) ? o.material : [o.material];
-        mats.forEach((mat) => {
-          if (mat.map) { mat.map.anisotropy = maxAnisotropy; mat.map.encoding = THREE.sRGBEncoding; }
-          if (mat.normalMap) mat.normalMap.anisotropy = maxAnisotropy;
-        });
-      }
       if (o.isSkinnedMesh && o.skeleton && !avatarSkeleton) {
         avatarSkeleton = o.skeleton;
         o.skeleton.bones.forEach((b) => {
@@ -816,15 +856,14 @@ PAGE_HTML = """<!DOCTYPE html>
     if (!avatarSkeleton && Object.keys(boneByName).length > 0) {
       avatarSkeleton = { bones: Object.values(boneByName), update: function() {} };
     }
-    const nBones = Object.keys(boneByName).length;
-    const hasSkel = !!(avatarSkeleton && (avatarSkeleton.bones || avatarSkeleton).length);
-    console.log('Avatar loaded: ' + nBones + ' bones, skeleton: ' + hasSkel);
-    console.log('Bone names:', Object.keys(boneByName).sort().join(', '));
-    // Keep model in its original facing direction; arms/torso logic already assumes camera-facing coordinates.
-    model.rotation.y = 0;
+
+    // Face the camera
+    model.rotation.y = Math.PI;
     model.position.set(0, 0, 0);
     model.scale.setScalar(1);
     model.updateMatrixWorld(true);
+
+    // Auto-scale to ~1.8m height and place on floor
     const box = new THREE.Box3().setFromObject(model);
     const size = box.getSize(new THREE.Vector3());
     const modelH = Math.max(Math.abs(size.y), 0.01);
@@ -837,15 +876,10 @@ PAGE_HTML = """<!DOCTYPE html>
     model.position.z = -center.z;
     model.position.y = -1 - box2.min.y;
     scene.add(model);
-    const dirLight2 = new THREE.DirectionalLight(0xffffff, 1.1);
-    dirLight2.position.set(0, 3, 3);
-    scene.add(dirLight2);
-    const fillLight = new THREE.DirectionalLight(0xffffff, 0.7);
-    fillLight.position.set(-2, 2, 2);
-    scene.add(fillLight);
-    const backLight = new THREE.DirectionalLight(0xffffff, 0.5);
-    backLight.position.set(0, 2, -3);
-    scene.add(backLight);
+
+    console.log('GLB avatar loaded. Bones:', Object.keys(boneByName).sort().join(', '));
+  }, undefined, (err) => {
+    console.error('Failed to load GLB avatar:', err);
   });
 
   function updatePosture(angle, good, status) {
@@ -857,7 +891,7 @@ PAGE_HTML = """<!DOCTYPE html>
   let lastAngle = null;
   let smoothJoints = null;
   let smoothHead = null;
-  const SMOOTH_ALPHA = 0.28;
+  const SMOOTH_ALPHA = 0.45;
   function blendJoints(prev, next, alpha) {
     if (!next) return prev;
     if (!prev) return next;
@@ -879,6 +913,7 @@ PAGE_HTML = """<!DOCTYPE html>
       updatePosture(d.angle, d.good_posture, d.status);
       smoothJoints = blendJoints(smoothJoints, d.driver_joints, SMOOTH_ALPHA);
       smoothHead = blendJoints(smoothHead, d.head_joints, SMOOTH_ALPHA);
+      // Connect dots: drive 3D model same-to-same from detection (joints + head).
       applyPose({ ...d, driver_joints: smoothJoints, head_joints: smoothHead });
     } catch (_) {}
   };
@@ -930,20 +965,12 @@ def video_feed():
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-@app.route("/final.glb")
-def serve_final_glb():
-    path = os.path.join(SCRIPT_DIR, "final.glb")
-    if not os.path.isfile(path):
-        return Response("final.glb not found", status=404)
-    return send_file(path, mimetype="model/gltf-binary", as_attachment=False)
-
-
 @app.route("/posture_events")
 def posture_events():
     def generate():
         while True:
             yield "data: " + json.dumps(shared.get_posture()) + "\n\n"
-            time.sleep(0.1)
+            time.sleep(0.05)
 
     return Response(
         generate(),
